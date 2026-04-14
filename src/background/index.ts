@@ -25,7 +25,8 @@ import type {
   QueueItem,
   ReviewState,
   StorageMode,
-  SuggestionResult
+  SuggestionResult,
+  WindowCaptureResult
 } from "../shared/types";
 
 const NOTIFICATION_PREFIX = "tab-queue-notification:";
@@ -40,6 +41,10 @@ function okReview(reviewState: ReviewState, state?: AppState): BackgroundRespons
 
 function okSuggestion(suggestion: SuggestionResult, state?: AppState): BackgroundResponse {
   return { ok: true, state, suggestion };
+}
+
+function okWindowCapture(windowCapture: WindowCaptureResult, state: AppState): BackgroundResponse {
+  return { ok: true, state, windowCapture };
 }
 
 function fail(error: unknown): BackgroundResponse {
@@ -61,6 +66,15 @@ function notificationId(id: string): string {
   return `${NOTIFICATION_PREFIX}${id}`;
 }
 
+function reminderWhen(item: Pick<QueueItem, "dueAt" | "reminderLeadMinutes">): number | null {
+  if (!item.dueAt) {
+    return null;
+  }
+
+  const leadMs = (item.reminderLeadMinutes ?? 0) * 60 * 1000;
+  return new Date(item.dueAt).getTime() - leadMs;
+}
+
 function extractIdFromAlarm(name: string): string | null {
   return name.startsWith(ALARM_PREFIX) ? name.slice(ALARM_PREFIX.length) : null;
 }
@@ -70,13 +84,18 @@ function extractIdFromNotification(id: string): string | null {
 }
 
 function notificationIcon(): string {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-    <rect width="128" height="128" rx="32" fill="#1f6f5f"/>
-    <path d="M26 39h76v14H26zM26 59h52v14H26zM26 79h40v14H26z" fill="#f3f0e8"/>
-    <circle cx="92" cy="86" r="18" fill="#f0b34a"/>
-  </svg>`;
+  return chrome.runtime.getURL("icons/icon128.png");
+}
 
-  return `data:image/svg+xml;base64,${btoa(svg)}`;
+async function updateDueBadge(state: AppState): Promise<void> {
+  const dueCount = state.items.filter((item) => item.dueAt && new Date(item.dueAt).getTime() <= Date.now()).length;
+
+  await chrome.action.setBadgeBackgroundColor({ color: dueCount > 0 ? "#f08aa2" : "#00000000" });
+  await chrome.action.setBadgeTextColor({ color: "#2f3442" });
+  await chrome.action.setBadgeText({ text: dueCount > 0 ? String(Math.min(dueCount, 99)) : "" });
+  await chrome.action.setTitle({
+    title: dueCount > 0 ? `Tab Queue · ${dueCount} tab${dueCount === 1 ? "" : "s"} due` : "Tab Queue"
+  });
 }
 
 async function getActiveTab(): Promise<chrome.tabs.Tab> {
@@ -87,6 +106,10 @@ async function getActiveTab(): Promise<chrome.tabs.Tab> {
   }
 
   return tab;
+}
+
+async function getCurrentWindowTabs(): Promise<chrome.tabs.Tab[]> {
+  return chrome.tabs.query({ currentWindow: true });
 }
 
 function reindexBucket(items: QueueItem[], bucket: BucketId): QueueItem[] {
@@ -124,20 +147,25 @@ async function scheduleAlarms(state: AppState): Promise<void> {
   await Promise.all(
     dueItems.map((item) =>
       chrome.alarms.create(alarmName(item.id), {
-        when: Math.max(Date.now() + 1_000, new Date(item.dueAt!).getTime())
+        when: Math.max(Date.now() + 1_000, reminderWhen(item) ?? new Date(item.dueAt!).getTime())
       })
     )
   );
+
+  await updateDueBadge(state);
 }
 
 async function notifyForItem(item: QueueItem): Promise<void> {
+  const isEarlyReminder = (item.reminderLeadMinutes ?? 0) > 0;
   await chrome.notifications.create(notificationId(item.id), {
     type: "basic",
     iconUrl: notificationIcon(),
-    title: "Time to revisit this tab",
+    title: isEarlyReminder ? `Coming up in ${item.reminderLeadMinutes} min` : "Time to revisit this tab",
     message: item.title,
-    contextMessage: item.note || "Tap to reopen and continue where you left off.",
-    priority: 1
+    contextMessage:
+      item.note ||
+      (isEarlyReminder ? `Tap to reopen before ${new Date(item.dueAt!).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.` : "Tap to reopen and continue where you left off."),
+    priority: 2
   });
 }
 
@@ -163,6 +191,7 @@ async function captureCurrentTab(payload: CapturePayload, shouldCloseTab: boolea
       faviconUrl: tab.favIconUrl,
       createdAt: nowIso(),
       dueAt,
+      reminderLeadMinutes: dueAt ? payload.reminderLeadMinutes ?? 0 : 0,
       bucket: nextBucket,
       priority: payload.priority,
       note: payload.note?.trim() || undefined,
@@ -184,6 +213,66 @@ async function captureCurrentTab(payload: CapturePayload, shouldCloseTab: boolea
   }
 
   return state;
+}
+
+async function captureCurrentWindow(): Promise<{ state: AppState; result: WindowCaptureResult }> {
+  const tabs = await getCurrentWindowTabs();
+  const activeTabId = tabs.find((tab) => tab.active)?.id;
+  const candidates = tabs.filter((tab) => tab.id && tab.id !== activeTabId && !tab.pinned && isCapturableUrl(tab.url));
+  let savedTabs: chrome.tabs.Tab[] = [];
+
+  const state = await updateState((currentState) => {
+    const remainingSlots = Math.max(0, ITEM_LIMIT - currentState.items.length);
+    const savableTabs = candidates.slice(0, remainingSlots);
+    savedTabs = savableTabs;
+
+    if (savableTabs.length === 0) {
+      return currentState;
+    }
+
+    let nextOrder =
+      currentState.items
+        .filter((item) => item.bucket === "later")
+        .reduce((max, item) => Math.max(max, item.order), -1) + 1;
+
+    const nextItems = savableTabs.map<QueueItem>((tab) => ({
+      id: crypto.randomUUID(),
+      url: tab.url!,
+      title: tab.title || "Untitled tab",
+      faviconUrl: tab.favIconUrl,
+      createdAt: nowIso(),
+      dueAt: undefined,
+      reminderLeadMinutes: 0,
+      bucket: "later",
+      priority: "medium",
+      note: undefined,
+      status: "pending",
+      updatedAt: nowIso(),
+      order: nextOrder++
+    }));
+
+    return {
+      ...currentState,
+      items: [...currentState.items, ...nextItems]
+    };
+  });
+
+  const closableTabIds = savedTabs.map((tab) => tab.id!).filter(Boolean);
+
+  if (closableTabIds.length > 0) {
+    await chrome.tabs.remove(closableTabIds);
+  }
+
+  await scheduleAlarms(state);
+
+  const skippedCount = tabs.length - 1 - closableTabIds.length;
+  return {
+    state,
+    result: {
+      savedCount: savedTabs.length,
+      skippedCount: Math.max(0, skippedCount)
+    }
+  };
 }
 
 async function openItem(id: string): Promise<AppState> {
@@ -213,6 +302,7 @@ async function openItem(id: string): Promise<AppState> {
   }
 
   await chrome.tabs.create({ url: item.url, active: true });
+  await updateDueBadge(state);
   return state;
 }
 
@@ -231,6 +321,7 @@ async function deleteItem(id: string): Promise<AppState> {
   });
 
   await chrome.alarms.clear(alarmName(id));
+  await updateDueBadge(state);
   return state;
 }
 
@@ -251,6 +342,7 @@ async function doneItem(id: string): Promise<AppState> {
       createdAt: target.createdAt,
       completedAt: nowIso(),
       dueAt: target.dueAt,
+      reminderLeadMinutes: target.reminderLeadMinutes,
       note: target.note
     };
 
@@ -264,6 +356,7 @@ async function doneItem(id: string): Promise<AppState> {
   });
 
   await chrome.alarms.clear(alarmName(id));
+  await updateDueBadge(state);
   return state;
 }
 
@@ -337,7 +430,7 @@ async function moveItem(id: string, bucket: BucketId, beforeId?: string): Promis
 
 async function updateItem(
   id: string,
-  patch: Partial<Pick<QueueItem, "note" | "priority" | "dueAt" | "bucket">>
+  patch: Partial<Pick<QueueItem, "note" | "priority" | "dueAt" | "bucket" | "reminderLeadMinutes">>
 ): Promise<AppState> {
   const state = await updateState((currentState) => {
     const target = currentState.items.find((item) => item.id === id);
@@ -358,6 +451,7 @@ async function updateItem(
               ...item,
               ...patch,
               dueAt: nextDueAt,
+              reminderLeadMinutes: nextDueAt ? patch.reminderLeadMinutes ?? item.reminderLeadMinutes ?? 0 : 0,
               bucket: nextBucket,
               updatedAt: nowIso()
             }
@@ -381,10 +475,13 @@ async function setArchiveSyncMode(archiveSyncMode: AppState["settings"]["archive
 }
 
 async function resetAllData(): Promise<AppState> {
-  return updateState((currentState) => ({
+  const state = await updateState((currentState) => ({
     ...currentState,
     completedItems: []
   }));
+
+  await updateDueBadge(state);
+  return state;
 }
 
 async function bootstrap(): Promise<void> {
@@ -412,6 +509,11 @@ async function handleMessage(request: BackgroundRequest): Promise<BackgroundResp
 
     if (request.type === "CAPTURE_CURRENT_TAB") {
       return ok(await captureCurrentTab(request.payload, true));
+    }
+
+    if (request.type === "CAPTURE_CURRENT_WINDOW") {
+      const { state, result } = await captureCurrentWindow();
+      return okWindowCapture(result, state);
     }
 
     if (request.type === "OPEN_ITEM") {
@@ -515,6 +617,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     if (item) {
       void notifyForItem(item);
     }
+
+    void updateDueBadge(state);
   });
 });
 

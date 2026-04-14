@@ -15,6 +15,11 @@ type ParsedTime = {
   cleanedText: string;
 };
 
+type ParsedTimeZone = {
+  matched: string;
+  timeZone: string;
+};
+
 type BuiltInAiCapability = {
   availability?: () => Promise<string>;
   create?: (options?: Record<string, unknown>) => Promise<{ prompt: (text: string) => Promise<string>; destroy?: () => void }>;
@@ -47,6 +52,12 @@ const MONTH_RULES = [
   { names: ["nov", "november"], month: 10 },
   { names: ["dec", "december"], month: 11 }
 ] as const;
+const TIME_ZONE_RULES: Array<{ names: string[]; timeZone: string }> = [
+  { names: ["pt", "pst", "pdt"], timeZone: "America/Los_Angeles" },
+  { names: ["mt", "mst", "mdt"], timeZone: "America/Denver" },
+  { names: ["ct", "cst", "cdt"], timeZone: "America/Chicago" },
+  { names: ["et", "est", "edt"], timeZone: "America/New_York" }
+];
 
 function domainForUrl(url: string): string {
   try {
@@ -62,6 +73,74 @@ function nextWeekday(targetDay: number): Date {
   const distance = (targetDay - date.getDay() + 7) % 7 || 7;
   date.setDate(date.getDate() + distance);
   return date;
+}
+
+function getTimeZoneParts(date: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+
+  const read = (type: string) => Number(parts.find((part) => part.type === type)?.value || 0);
+  return {
+    year: read("year"),
+    month: read("month"),
+    day: read("day"),
+    hour: read("hour"),
+    minute: read("minute"),
+    second: read("second")
+  };
+}
+
+function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
+  const zoned = getTimeZoneParts(date, timeZone);
+  const asUtc = Date.UTC(zoned.year, zoned.month - 1, zoned.day, zoned.hour, zoned.minute, zoned.second);
+  return asUtc - date.getTime();
+}
+
+function zonedDateTimeToIso(
+  year: number,
+  month: number,
+  day: number,
+  hours: number,
+  minutes: number,
+  timeZone: string
+): string {
+  const wallUtc = Date.UTC(year, month, day, hours, minutes, 0, 0);
+  let guess = wallUtc - getTimeZoneOffsetMs(new Date(wallUtc), timeZone);
+
+  for (let index = 0; index < 3; index += 1) {
+    const offset = getTimeZoneOffsetMs(new Date(guess), timeZone);
+    const nextGuess = wallUtc - offset;
+    if (Math.abs(nextGuess - guess) < 1_000) {
+      guess = nextGuess;
+      break;
+    }
+    guess = nextGuess;
+  }
+
+  return new Date(guess).toISOString();
+}
+
+function parseTimeZone(text: string): ParsedTimeZone | null {
+  for (const rule of TIME_ZONE_RULES) {
+    const pattern = new RegExp(`\\b(${rule.names.join("|")})\\b`, "i");
+    const match = text.match(pattern);
+    if (match) {
+      return {
+        matched: match[0],
+        timeZone: rule.timeZone
+      };
+    }
+  }
+
+  return null;
 }
 
 function parseClock(text: string): { hours: number; minutes: number; matched: string } | null {
@@ -172,11 +251,27 @@ function parseTimeIntent(text: string): ParsedTime {
   const lowered = text.toLowerCase();
   const clock = parseClock(text);
   const absoluteDate = parseAbsoluteDate(text);
+  const parsedZone = parseTimeZone(text);
+
+  const toIso = (date: Date, timeZone?: string) => {
+    if (!timeZone) {
+      return date.toISOString();
+    }
+
+    return zonedDateTimeToIso(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate(),
+      date.getHours(),
+      date.getMinutes(),
+      timeZone
+    );
+  };
 
   if (absoluteDate) {
     const date = new Date(absoluteDate.date);
     applyTime(date, clock ?? { hours: 9, minutes: 0 });
-    dueAt = date.toISOString();
+    dueAt = toIso(date, parsedZone?.timeZone);
     preset = "custom";
     cleaned = cleaned.replace(absoluteDate.matched, " ");
   }
@@ -189,7 +284,7 @@ function parseTimeIntent(text: string): ParsedTime {
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     applyTime(tomorrow, clock ?? { hours: 9, minutes: 0 });
-    dueAt = tomorrow.toISOString();
+    dueAt = toIso(tomorrow, parsedZone?.timeZone);
     preset = clock ? "custom" : "tomorrow";
     cleaned = cleaned.replace(/\btomorrow\b/gi, " ");
   } else if (!dueAt && /\b(this )?weekend\b/i.test(text)) {
@@ -203,7 +298,7 @@ function parseTimeIntent(text: string): ParsedTime {
       if (match) {
         const target = nextWeekday(rule.day);
         applyTime(target, clock ?? { hours: 9, minutes: 0 });
-        dueAt = target.toISOString();
+        dueAt = toIso(target, parsedZone?.timeZone);
         preset = "custom";
         cleaned = cleaned.replace(pattern, " ");
         break;
@@ -215,13 +310,17 @@ function parseTimeIntent(text: string): ParsedTime {
     const today = new Date();
     applyTime(today, clock);
     if (today.getTime() > Date.now()) {
-      dueAt = today.toISOString();
+      dueAt = toIso(today, parsedZone?.timeZone);
       preset = "custom";
     }
   }
 
   if (clock) {
     cleaned = cleaned.replace(clock.matched, " ");
+  }
+
+  if (parsedZone) {
+    cleaned = cleaned.replace(new RegExp(`\\b${parsedZone.matched}\\b`, "i"), " ");
   }
 
   const normalized = cleaned.replace(/\s+/g, " ").trim();

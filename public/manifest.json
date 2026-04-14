@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Queue",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Capture unfinished tabs, close them safely, and come back at the right time.",
   "icons": {
     "16": "icons/icon16.png",

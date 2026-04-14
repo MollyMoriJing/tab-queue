@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BUCKET_LABELS } from "../shared/constants";
 import {
   buildDueAtFromPreset,
@@ -43,30 +43,7 @@ type FlashState = {
 };
 
 type ViewMode = "queue" | "review";
-type MicPermissionState = "unknown" | "requesting" | "granted" | "denied";
 type CatMood = "calm" | "busy" | "frazzled";
-
-type SpeechRecognitionLike = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
-  onerror: ((event: { error: string }) => void) | null;
-  onend: (() => void) | null;
-};
-
-type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
-
-function getSpeechRecognitionCtor(): SpeechRecognitionCtor | null {
-  const source = globalThis as unknown as {
-    SpeechRecognition?: SpeechRecognitionCtor;
-    webkitSpeechRecognition?: SpeechRecognitionCtor;
-  };
-
-  return source.SpeechRecognition ?? source.webkitSpeechRecognition ?? null;
-}
 
 function BucketSection(props: {
   bucket: BucketId;
@@ -136,6 +113,9 @@ function BucketSection(props: {
               <div className="item-meta">
                 <span className="badge">{item.status === "in_progress" ? "in progress" : "queued"}</span>
                 <span className="badge">{formatDueLabel(item.dueAt)}</span>
+                {item.dueAt && (item.reminderLeadMinutes ?? 0) > 0 ? (
+                  <span className="badge soft">+{item.reminderLeadMinutes} min early</span>
+                ) : null}
               </div>
 
               {item.note ? <div className="note">{item.note}</div> : null}
@@ -181,6 +161,9 @@ function ReviewItem({ item, onOpen }: { item: CompletedItem; onOpen: (url: strin
       <div className="item-meta">
         <span className="badge">{BUCKET_LABELS[item.bucket]}</span>
         <span className="badge">Done {formatDueLabel(item.completedAt)}</span>
+        {item.dueAt && (item.reminderLeadMinutes ?? 0) > 0 ? (
+          <span className="badge soft">+{item.reminderLeadMinutes} min early</span>
+        ) : null}
       </div>
 
       {item.note ? <div className="note">{item.note}</div> : null}
@@ -316,17 +299,13 @@ function App() {
   const [captureBucket, setCaptureBucket] = useState<BucketId>("later");
   const [captureDueAt, setCaptureDueAt] = useState("");
   const [capturePreset, setCapturePreset] = useState<ReminderPreset>("none");
+  const [captureReminderLeadMinutes, setCaptureReminderLeadMinutes] = useState(0);
   const [capturing, setCapturing] = useState(false);
   const [suggestion, setSuggestion] = useState<SuggestionResult | null>(null);
   const [noteTouched, setNoteTouched] = useState(false);
   const [priorityTouched, setPriorityTouched] = useState(false);
   const [bucketTouched, setBucketTouched] = useState(false);
   const [dueAtTouched, setDueAtTouched] = useState(false);
-  const [listening, setListening] = useState(false);
-  const [voiceSupported] = useState(() => !!getSpeechRecognitionCtor());
-  const [micPermission, setMicPermission] = useState<MicPermissionState>("unknown");
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const transcriptRef = useRef("");
 
   useEffect(() => {
     void refreshState();
@@ -345,6 +324,7 @@ function App() {
     setCaptureBucket("later");
     setCaptureDueAt("");
     setCapturePreset("none");
+    setCaptureReminderLeadMinutes(0);
     setSuggestion(null);
     setShowCaptureDetails(false);
     setNoteTouched(false);
@@ -545,7 +525,8 @@ function App() {
           priority: capturePriority,
           bucket,
           reminderPreset: effectivePreset,
-          dueAt
+          dueAt,
+          reminderLeadMinutes: dueAt ? captureReminderLeadMinutes : 0
         }
       }),
       { message: "Tab captured and closed." }
@@ -559,6 +540,7 @@ function App() {
       setCaptureBucket("later");
       setCaptureDueAt("");
       setCapturePreset("none");
+      setCaptureReminderLeadMinutes(0);
       setShowCaptureDetails(false);
       setSuggestion(null);
       setNoteTouched(false);
@@ -568,6 +550,36 @@ function App() {
       setActiveTab(null);
       await refreshActiveTab();
     }
+  }
+
+  async function handleCaptureWindow() {
+    setCapturing(true);
+    setError(null);
+
+    const response = await sendBackgroundMessage({ type: "CAPTURE_CURRENT_WINDOW" });
+    setCapturing(false);
+
+    if (!response.ok || !response.state || !response.windowCapture) {
+      setError(response.error || "Could not save this window.");
+      return;
+    }
+
+    setState(response.state);
+    setReviewState({
+      completedItems: response.state.completedItems,
+      stats: response.state.stats
+    });
+
+    const { savedCount, skippedCount } = response.windowCapture;
+    setFlash({
+      message:
+        savedCount > 0
+          ? `Saved ${savedCount} tab${savedCount === 1 ? "" : "s"} from this window.${skippedCount > 0 ? ` Skipped ${skippedCount}.` : ""}`
+          : `No tabs saved.${skippedCount > 0 ? ` Skipped ${skippedCount}.` : ""}`,
+      error: savedCount === 0
+    });
+
+    await refreshActiveTab();
   }
 
   async function applyQuickParse(title: string, url: string, rawQuickInput: string, currentNote: string) {
@@ -680,105 +692,6 @@ function App() {
     });
   }
 
-  async function applyVoiceTranscript(transcript: string) {
-    const response = await sendBackgroundMessage({
-      type: "REQUEST_VOICE_PARSE",
-      transcript,
-      transcriptSource: "speech_recognition"
-    });
-
-    if (!response.ok || !response.voiceCapture) {
-      setError(response.error || "Could not use that voice note.");
-      return;
-    }
-
-    setShowCaptureDetails(true);
-    setCaptureNote(response.voiceCapture.note || "");
-    setCaptureDueAt(toDateTimeLocalValue(dueHintToDueAt(response.voiceCapture.dueHint)));
-    if (response.voiceCapture.dueHint?.dueAt) {
-      setCaptureBucket(deriveBucketFromDueAt(response.voiceCapture.dueHint.dueAt));
-    }
-    setFlash({ message: "Voice note applied to this capture." });
-  }
-
-  function stopListening() {
-    recognitionRef.current?.stop();
-  }
-
-  async function ensureMicrophonePermission(): Promise<boolean> {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError("Microphone access is not available in this browser view.");
-      return false;
-    }
-
-    if (micPermission === "granted") {
-      return true;
-    }
-
-    setMicPermission("requesting");
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      stream.getTracks().forEach((track) => track.stop());
-      setMicPermission("granted");
-      return true;
-    } catch {
-      setMicPermission("denied");
-      setError("Microphone access is blocked. Allow mic access in Chrome, then try again.");
-      return false;
-    }
-  }
-
-  async function startListening() {
-    const SpeechRecognition = getSpeechRecognitionCtor();
-    if (!SpeechRecognition || listening) {
-      if (listening) {
-        stopListening();
-      }
-      return;
-    }
-
-    const hasPermission = await ensureMicrophonePermission();
-    if (!hasPermission) {
-      return;
-    }
-
-    transcriptRef.current = "";
-    const recognition = new SpeechRecognition();
-    recognition.lang = "en-US";
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const transcript = Array.from(event.results)
-        .map((result) => result[0]?.transcript ?? "")
-        .join(" ")
-        .trim();
-      transcriptRef.current = transcript;
-    };
-    recognition.onerror = (event) => {
-      recognitionRef.current = null;
-      setListening(false);
-      if (event.error === "not-allowed") {
-        setMicPermission("denied");
-        setError("Microphone access is blocked. Allow mic access in Chrome, then try again.");
-        return;
-      }
-
-      setError(`Voice capture stopped: ${event.error}.`);
-    };
-    recognition.onend = () => {
-      recognitionRef.current = null;
-      setListening(false);
-      if (transcriptRef.current) {
-        void applyVoiceTranscript(transcriptRef.current);
-      }
-    };
-
-    recognitionRef.current = recognition;
-    setListening(true);
-    recognition.start();
-  }
-
   const summary = useMemo(() => (state ? getQueueSummary(state.items) : null), [state]);
   const grouped = useMemo(() => (state ? groupItemsByBucket(state.items) : null), [state]);
   const currentEditDueAt = editingItem ? toDateTimeLocalValue(editingItem.dueAt) : "";
@@ -849,7 +762,7 @@ function App() {
   const previewBucket = previewDueAt ? deriveBucketFromDueAt(previewDueAt) : captureBucket;
   const activeDomain = activeTab ? domainForUrl(activeTab.url) : "";
   const statusSummary = previewDueAt
-    ? `Will remind ${formatDueLabel(previewDueAt)} · ${BUCKET_LABELS[previewBucket]}`
+    ? `Will remind ${formatDueLabel(previewDueAt)}${captureReminderLeadMinutes > 0 ? ` · ${captureReminderLeadMinutes} min early` : ""} · ${BUCKET_LABELS[previewBucket]}`
     : `Will save to ${BUCKET_LABELS[previewBucket]} · ${capturePriority}`;
 
   return (
@@ -914,9 +827,11 @@ function App() {
                       {activeTab ? activeTab.title : "Open a normal web page to capture it."}
                     </div>
                   </div>
-                  <button className="button small ghost details-toggle" onClick={() => setShowCaptureDetails((value) => !value)}>
-                    {showCaptureDetails ? "Less" : "Details"}
-                  </button>
+                  <div className="capture-actions">
+                    <button className="button small ghost details-toggle" onClick={() => setShowCaptureDetails((value) => !value)}>
+                      {showCaptureDetails ? "Less" : "Details"}
+                    </button>
+                  </div>
                 </div>
 
                 {activeTab ? (
@@ -929,7 +844,7 @@ function App() {
                         className="quick-input"
                         id="quick-input"
                         type="text"
-                        placeholder="Fri 3pm reply"
+                        placeholder="Apr 17 8am or Fri 3pm PT"
                         value={quickInput}
                         onChange={(event) => setQuickInput(event.target.value)}
                       />
@@ -974,6 +889,7 @@ function App() {
                         onClick={() => {
                           setCapturePreset("none");
                           setCaptureDueAt("");
+                          setCaptureReminderLeadMinutes(0);
                           setDueAtTouched(true);
                           setCaptureBucket("later");
                         }}
@@ -1026,10 +942,22 @@ function App() {
                           setDueAtTouched(true);
                           if (event.target.value) {
                             setCaptureBucket(deriveBucketFromDueAt(new Date(event.target.value).toISOString()));
+                          } else {
+                            setCaptureReminderLeadMinutes(0);
                           }
                         }}
                       />
                     </div>
+
+                    <label className={`inline-check ${!captureDueAt && capturePreset === "none" ? "disabled" : ""}`}>
+                      <input
+                        type="checkbox"
+                        checked={captureReminderLeadMinutes === 15}
+                        disabled={!captureDueAt && capturePreset === "none"}
+                        onChange={(event) => setCaptureReminderLeadMinutes(event.target.checked ? 15 : 0)}
+                      />
+                      <span>Remind me 15 min early</span>
+                    </label>
 
                     <button className="button save-button" disabled={capturing} onClick={() => void handleCapture(capturePreset)}>
                       {capturing ? "Saving..." : "Save"}
@@ -1059,7 +987,7 @@ function App() {
                             <label htmlFor="capture-bucket">Bucket</label>
                             <select
                               id="capture-bucket"
-                              value={captureBucket}
+                            value={captureBucket}
                               onChange={(event) => {
                                 setCaptureBucket(event.target.value as BucketId);
                                 setBucketTouched(true);
@@ -1073,60 +1001,31 @@ function App() {
                             </select>
                           </div>
                         </div>
-
-                        <div className="field">
-                          <label htmlFor="capture-dueAt">Custom reminder</label>
-                          <input
-                            id="capture-dueAt"
-                            type="datetime-local"
-                            value={captureDueAt}
-                            onChange={(event) => {
-                              setCaptureDueAt(event.target.value);
-                              setDueAtTouched(true);
-                              if (event.target.value) {
-                                setCaptureBucket(
-                                  deriveBucketFromDueAt(new Date(event.target.value).toISOString())
-                                );
-                                setBucketTouched(true);
-                              }
-                            }}
-                          />
-                        </div>
-
-                        <div className="row" style={{ flexWrap: "wrap" }}>
-                          <button
-                            className="button small ghost"
-                            disabled={!voiceSupported || micPermission === "requesting"}
-                            onClick={() => void startListening()}
-                          >
-                            {!voiceSupported
-                              ? "Voice unavailable"
-                              : micPermission === "requesting"
-                                ? "Allowing mic..."
-                                : listening
-                                  ? "Stop listening"
-                                  : micPermission === "granted"
-                                    ? "Press to talk"
-                                    : "Enable mic"}
-                          </button>
-                          <span className="subtle" style={{ fontSize: 12 }}>
-                            Fills note + time only.
-                          </span>
-                        </div>
-
-                        <div className="row">
-                          <button className="button secondary" disabled={capturing} onClick={() => void handleCapture("custom")}>
-                            Save with custom time
-                          </button>
-                        </div>
                       </>
-                    ) : (
-                      <div className="capture-hint">Example: Apr 17 8am</div>
-                    )}
+                    ) : null}
                   </>
                 ) : (
                   <div className="empty-state">Open a normal page, then tap the extension again.</div>
                 )}
+              </section>
+            ) : null}
+
+            {activeTab ? (
+              <section className="card bulk-capture-card">
+                <div className="bulk-capture-head">
+                  <div>
+                    <div className="eyebrow">Window</div>
+                    <div className="bulk-capture-title">Save all the other tabs in this window</div>
+                  </div>
+                </div>
+                <div className="bulk-capture-note">Saves normal web pages only. Skips this tab and pinned tabs.</div>
+                <button
+                  className="button secondary bulk-capture-button"
+                  disabled={capturing}
+                  onClick={() => void handleCaptureWindow()}
+                >
+                  Save other tabs in this window
+                </button>
               </section>
             ) : null}
 
@@ -1205,11 +1104,27 @@ function App() {
                     onChange={(event) => {
                       setEditingItem({
                         ...editingItem,
-                        dueAt: event.target.value ? new Date(event.target.value).toISOString() : undefined
+                        dueAt: event.target.value ? new Date(event.target.value).toISOString() : undefined,
+                        reminderLeadMinutes: event.target.value ? editingItem.reminderLeadMinutes ?? 0 : 0
                       });
                     }}
                   />
                 </div>
+
+                <label className={`inline-check ${!editingItem.dueAt ? "disabled" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={(editingItem.reminderLeadMinutes ?? 0) === 15}
+                    disabled={!editingItem.dueAt}
+                    onChange={(event) =>
+                      setEditingItem({
+                        ...editingItem,
+                        reminderLeadMinutes: event.target.checked ? 15 : 0
+                      })
+                    }
+                  />
+                  <span>Remind me 15 min early</span>
+                </label>
 
                 <div className="row">
                   <button
@@ -1223,7 +1138,8 @@ function App() {
                             note: editingItem.note,
                             priority: editingItem.priority,
                             dueAt: editingItem.dueAt,
-                            bucket: editingItem.bucket
+                            bucket: editingItem.bucket,
+                            reminderLeadMinutes: editingItem.reminderLeadMinutes
                           }
                         }),
                         { message: "Updated." }
@@ -1315,7 +1231,7 @@ function App() {
                 <div className="compact-settings-copy">
                   <span className="eyebrow">Storage</span>
                   <span className="subtle">Local: only on this device</span>
-                  <span className="subtle">Sync: across your Chrome devices</span>
+                  <span className="subtle">Sync: across your Chrome devices if Chrome Sync is on</span>
                 </div>
                 <div className="toggle" aria-label="Storage mode">
                   <button

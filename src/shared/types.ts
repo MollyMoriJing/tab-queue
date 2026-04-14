@@ -14,6 +14,7 @@ export interface QueueItem {
   faviconUrl?: string;
   createdAt: string;
   dueAt?: string;
+  reminderLeadMinutes?: number;
   bucket: BucketId;
   priority: Priority;
   note?: string;
@@ -32,6 +33,7 @@ export interface CompletedItem {
   createdAt: string;
   completedAt: string;
   dueAt?: string;
+  reminderLeadMinutes?: number;
   note?: string;
 }
 
@@ -85,6 +87,7 @@ export interface CapturePayload {
   bucket?: BucketId;
   reminderPreset: ReminderPreset;
   dueAt?: string;
+  reminderLeadMinutes?: number;
 }
 
 export interface SuggestionInput {
@@ -105,4 +108,9 @@ export interface QueueSummary {
 export interface ReviewState {
   completedItems: CompletedItem[];
   stats: CompletionStats;
+}
+
+export interface WindowCaptureResult {
+  savedCount: number;
+  skippedCount: number;
 }

@@ -34,6 +34,12 @@ type StoredArchiveState = {
   updatedAt: string;
 };
 
+type StoredSettings = {
+  version: number;
+  settings: Partial<AppSettings>;
+  updatedAt: string;
+};
+
 function estimateSize(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length;
 }
@@ -146,29 +152,81 @@ function sanitizeSettings(settings?: Partial<AppSettings>): AppSettings {
   };
 }
 
+function parseStoredSettings(payload: unknown): StoredSettings | undefined {
+  if (!payload || typeof payload !== "object") {
+    return undefined;
+  }
+
+  const candidate = payload as Partial<StoredSettings>;
+  if (!candidate.settings || typeof candidate.settings !== "object" || typeof candidate.updatedAt !== "string") {
+    return undefined;
+  }
+
+  return {
+    version: candidate.version ?? 1,
+    settings: candidate.settings,
+    updatedAt: candidate.updatedAt
+  };
+}
+
 async function getStoredSettings(): Promise<Partial<AppSettings>> {
-  const result = await chrome.storage.local.get([SETTINGS_KEY, STORAGE_MODE_KEY, ARCHIVE_SYNC_MODE_KEY]);
-  const settings = (result[SETTINGS_KEY] as Partial<AppSettings> | undefined) ?? {};
+  const [localResult, syncResult] = await Promise.all([
+    chrome.storage.local.get([SETTINGS_KEY, STORAGE_MODE_KEY, ARCHIVE_SYNC_MODE_KEY]),
+    chrome.storage.sync.get([SETTINGS_KEY, STORAGE_MODE_KEY, ARCHIVE_SYNC_MODE_KEY])
+  ]);
+
+  const localStored = parseStoredSettings(localResult[SETTINGS_KEY]);
+  const syncStored = parseStoredSettings(syncResult[SETTINGS_KEY]);
+  const stored =
+    localStored && syncStored
+      ? new Date(syncStored.updatedAt).getTime() > new Date(localStored.updatedAt).getTime()
+        ? syncStored
+        : localStored
+      : syncStored ?? localStored;
+
+  const settings = stored?.settings ?? ((localResult[SETTINGS_KEY] as Partial<AppSettings> | undefined) ?? {});
+  const localStorageMode = localResult[STORAGE_MODE_KEY];
+  const syncStorageMode = syncResult[STORAGE_MODE_KEY];
+  const localArchiveMode = localResult[ARCHIVE_SYNC_MODE_KEY];
+  const syncArchiveMode = syncResult[ARCHIVE_SYNC_MODE_KEY];
+
+  const resolvedStorageMode =
+    settings.storageMode ??
+    (syncStorageMode === "sync" ? "sync" : localStorageMode === "sync" ? "sync" : undefined);
+  const resolvedArchiveMode =
+    settings.archiveSyncMode ??
+    ((syncArchiveMode === "follow_queue" || syncArchiveMode === "sync_enabled"
+      ? syncArchiveMode
+      : syncArchiveMode === "local_only"
+        ? "local_only"
+        : undefined) ??
+      (localArchiveMode === "follow_queue" || localArchiveMode === "sync_enabled"
+        ? localArchiveMode
+        : localArchiveMode === "local_only"
+          ? "local_only"
+          : undefined));
 
   return {
     ...settings,
-    storageMode: result[STORAGE_MODE_KEY] === "sync" ? "sync" : settings.storageMode,
-    archiveSyncMode: (
-      result[ARCHIVE_SYNC_MODE_KEY] === "follow_queue" || result[ARCHIVE_SYNC_MODE_KEY] === "sync_enabled"
-        ? result[ARCHIVE_SYNC_MODE_KEY]
-        : result[ARCHIVE_SYNC_MODE_KEY] === "local_only"
-          ? "local_only"
-          : settings.archiveSyncMode
-    ) as ArchiveSyncMode | undefined
+    storageMode: resolvedStorageMode,
+    archiveSyncMode: resolvedArchiveMode as ArchiveSyncMode | undefined
   };
 }
 
 async function saveSettings(settings: AppSettings): Promise<void> {
-  await chrome.storage.local.set({
-    [SETTINGS_KEY]: settings,
+  const payload: StoredSettings = {
+    version: 1,
+    settings,
+    updatedAt: nowIso()
+  };
+
+  const mirrored = {
+    [SETTINGS_KEY]: payload,
     [STORAGE_MODE_KEY]: settings.storageMode,
     [ARCHIVE_SYNC_MODE_KEY]: settings.archiveSyncMode
-  });
+  };
+
+  await Promise.all([chrome.storage.local.set(mirrored), chrome.storage.sync.set(mirrored)]);
 }
 
 async function loadStoredActiveState(settings: AppSettings): Promise<StoredActiveState | undefined> {
@@ -249,9 +307,9 @@ export async function saveState(state: AppState): Promise<AppState> {
   const normalizedItems = normalizeItems(state.items);
   const normalizedArchive = normalizeArchiveItems(state.completedItems);
 
-  await saveSettings(settings);
   await saveStoredActiveState(normalizedItems, settings);
   await saveStoredArchiveState(normalizedArchive, settings);
+  await saveSettings(settings);
 
   return {
     version: 2,

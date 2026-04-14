@@ -9,7 +9,8 @@ import type {
   SuggestionResult,
   VoiceCaptureResult,
   ArchiveSyncMode,
-  TranscriptSource
+  TranscriptSource,
+  WindowCaptureResult
 } from "./types";
 
 export type BackgroundRequest =
@@ -17,6 +18,7 @@ export type BackgroundRequest =
   | { type: "GET_REVIEW_STATE" }
   | { type: "RESET_ALL_DATA" }
   | { type: "CAPTURE_CURRENT_TAB"; payload: CapturePayload }
+  | { type: "CAPTURE_CURRENT_WINDOW" }
   | { type: "OPEN_ITEM"; id: string }
   | { type: "DONE_ITEM"; id: string }
   | { type: "DELETE_ITEM"; id: string }
@@ -27,7 +29,11 @@ export type BackgroundRequest =
   | { type: "REQUEST_SMART_SUGGEST"; payload: SuggestionInput }
   | { type: "REQUEST_QUICK_PARSE"; payload: SuggestionInput }
   | { type: "REQUEST_VOICE_PARSE"; transcript: string; transcriptSource: TranscriptSource }
-  | { type: "UPDATE_ITEM"; id: string; patch: Partial<Pick<QueueItem, "note" | "priority" | "dueAt" | "bucket">> };
+  | {
+      type: "UPDATE_ITEM";
+      id: string;
+      patch: Partial<Pick<QueueItem, "note" | "priority" | "dueAt" | "bucket" | "reminderLeadMinutes">>;
+    };
 
 export interface BackgroundResponse {
   ok: boolean;
@@ -35,6 +41,7 @@ export interface BackgroundResponse {
   reviewState?: ReviewState;
   suggestion?: SuggestionResult;
   voiceCapture?: VoiceCaptureResult;
+  windowCapture?: WindowCaptureResult;
   error?: string;
 }
 
